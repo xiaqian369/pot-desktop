@@ -1,152 +1,134 @@
 import { fetch, Body } from '@tauri-apps/api/http';
 import { Language } from './info';
-import { defaultRequestArguments } from './Config';
+import {
+    API_TYPE_RESPONSES,
+    buildEndpointCandidates,
+    buildPromptList,
+    buildRequestBody,
+    buildRequestHeaders,
+    createSseParser,
+    extractChatCompletionContent,
+    extractResponsesContent,
+    extractStreamDelta,
+    resolveApiType,
+} from './request';
 
 export async function translate(text, from, to, options) {
     const { config, setResult, detect } = options;
 
-    let { service, requestPath, model, apiKey, stream, promptList, requestArguments } = config;
-
-    if (!/https?:\/\/.+/.test(requestPath)) {
-        requestPath = `https://${requestPath}`;
-    }
-    const apiUrl = new URL(requestPath);
-
-    // in openai like api, /v1 is not required
-    if (service === 'openai' && !apiUrl.pathname.endsWith('/chat/completions')) {
-        // not openai like, populate completion endpoint
-        apiUrl.pathname += apiUrl.pathname.endsWith('/') ? '' : '/';
-        apiUrl.pathname += 'v1/chat/completions';
-    }
-
-    // 兼容旧版
-    if (promptList === undefined) {
-        promptList = [
-            {
-                role: 'system',
-                content:
-                    'You are a professional translation engine, please translate the text into a colloquial, professional, elegant and fluent content, without the style of machine translation. You must only translate the text content, never interpret it.',
-            },
-            { role: 'user', content: `Translate into $to:\n"""\n$text\n"""` },
-        ];
-    }
-
-    promptList = promptList.map((item) => {
-        return {
-            ...item,
-            content: item.content
-                .replaceAll('$text', text)
-                .replaceAll('$from', from)
-                .replaceAll('$to', to)
-                .replaceAll('$detect', Language[detect]),
-        };
+    const apiType = resolveApiType(config);
+    const headers = buildRequestHeaders(config);
+    const promptList = buildPromptList(config, {
+        text,
+        from,
+        to,
+        detect: Language[detect],
     });
+    const body = buildRequestBody(config, promptList);
 
-    const headers =
-        service === 'openai'
-            ? {
-                  'Content-Type': 'application/json',
-                  Authorization: `Bearer ${apiKey}`,
-              }
-            : {
-                  'Content-Type': 'application/json',
-                  'api-key': apiKey,
-              };
-    const body = {
-        ...JSON.parse(requestArguments ?? defaultRequestArguments),
-        stream: stream,
-        messages: promptList,
-    };
-    if (service === 'openai') {
-        body['model'] = model;
+    const candidates = buildEndpointCandidates(config, apiType);
+    const errors = [];
+
+    for (const candidate of candidates) {
+        try {
+            if (config.stream) {
+                return await translateWithStream(candidate.href, headers, body, apiType, setResult);
+            }
+            return await translateOnce(candidate.href, headers, body, apiType);
+        } catch (error) {
+            errors.push(error);
+        }
     }
-    if (stream) {
-        const res = await window.fetch(apiUrl.href, {
+
+    // 所有候选都失败时抛出默认协议那次的错误，保持原有报错内容。
+    throw errors[0];
+}
+
+async function translateWithStream(url, headers, body, apiType, setResult) {
+    let res;
+    try {
+        // 流式输出走 WebView 的原生 fetch。pot 的窗口以 --disable-web-security 启动，
+        // 因此这里不会受浏览器同源策略（CORS）限制。
+        res = await window.fetch(url, {
             method: 'POST',
             headers: headers,
             body: JSON.stringify(body),
         });
-        if (res.ok) {
-            let target = '';
-            const reader = res.body.getReader();
-            try {
-                let temp = '';
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) {
-                        setResult(target.trim());
-                        return target.trim();
-                    }
-                    const str = new TextDecoder().decode(value);
-                    let datas = str.split('data:');
-                    for (let data of datas) {
-                        if (data.trim() !== '' && data.trim() !== '[DONE]') {
-                            try {
-                                if (temp !== '') {
-                                    data = temp + data.trim();
-                                    let result = JSON.parse(data.trim());
-                                    if (result.choices[0].delta.content) {
-                                        target += result.choices[0].delta.content;
-                                        if (setResult) {
-                                            setResult(target + '_');
-                                        } else {
-                                            return '[STREAM]';
-                                        }
-                                    }
-                                    temp = '';
-                                } else {
-                                    let result = JSON.parse(data.trim());
-                                    if (result.choices[0].delta.content) {
-                                        target += result.choices[0].delta.content;
-                                        if (setResult) {
-                                            setResult(target + '_');
-                                        } else {
-                                            return '[STREAM]';
-                                        }
-                                    }
-                                }
-                            } catch {
-                                temp = data.trim();
-                            }
-                        }
-                    }
-                }
-            } finally {
-                reader.releaseLock();
-            }
-        } else {
-            throw `Http Request Error\nHttp Status: ${res.status}\n${JSON.stringify(res.data)}`;
-        }
-    } else {
-        let res = await fetch(apiUrl.href, {
-            method: 'POST',
-            headers: headers,
-            body: Body.json(body),
-        });
-        if (res.ok) {
-            let result = res.data;
-            const { choices } = result;
-            if (choices) {
-                let target = choices[0].message.content.trim();
-                if (target) {
-                    if (target.startsWith('"')) {
-                        target = target.slice(1);
-                    }
-                    if (target.endsWith('"')) {
-                        target = target.slice(0, -1);
-                    }
-                    return target.trim();
-                } else {
-                    throw JSON.stringify(choices);
-                }
-            } else {
-                throw JSON.stringify(result);
-            }
-        } else {
-            throw `Http Request Error\nHttp Status: ${res.status}\n${JSON.stringify(res.data)}`;
-        }
+    } catch (e) {
+        throw new Error(
+            `${e}\n\n流式请求未能发出，请检查请求地址是否可达、是否需要代理；` +
+                '也可以先在配置里关闭“流式输出”，改用普通请求确认接口本身是通的。'
+        );
     }
+
+    if (!res.ok) {
+        throw `Http Request Error\nHttp Status: ${res.status}\n${await res.text()}`;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    const parseSse = createSseParser();
+    let target = '';
+
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) {
+                break;
+            }
+            for (const event of parseSse(decoder.decode(value, { stream: true }))) {
+                if (event.done || !event.json) {
+                    continue;
+                }
+                const delta = extractStreamDelta(event.json, apiType);
+                if (delta === '') {
+                    continue;
+                }
+                target += delta;
+                if (setResult) {
+                    setResult(target + '_');
+                } else {
+                    await reader.cancel();
+                    return '[STREAM]';
+                }
+            }
+        }
+    } finally {
+        reader.releaseLock();
+    }
+
+    if (setResult) {
+        setResult(target.trim());
+    }
+    return target.trim();
+}
+
+async function translateOnce(url, headers, body, apiType) {
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: headers,
+        body: Body.json(body),
+    });
+
+    if (!res.ok) {
+        throw `Http Request Error\nHttp Status: ${res.status}\n${JSON.stringify(res.data)}`;
+    }
+
+    const target =
+        apiType === API_TYPE_RESPONSES ? extractResponsesContent(res.data) : extractChatCompletionContent(res.data);
+
+    if (target !== '') {
+        return target;
+    }
+
+    // 有些推理模型会把 token 全花在思考内容上，正文为空，这里给出更明确的提示。
+    const reasoning = res.data?.choices?.[0]?.message?.reasoning_content;
+    if (typeof reasoning === 'string' && reasoning.trim() !== '') {
+        throw `模型只返回了思考内容而没有返回正文，请检查 max_tokens 之类的长度参数是否过小。\n\n${JSON.stringify(res.data)}`;
+    }
+    throw JSON.stringify(res.data);
 }
 
 export * from './Config';
 export * from './info';
+export * from './request';
